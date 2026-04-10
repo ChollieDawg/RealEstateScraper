@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import re
 import time
 from dataclasses import dataclass, asdict
@@ -85,34 +86,73 @@ def matches_keywords(text: str) -> Dict[str, bool]:
     return output
 
 
+def _normalize_listing_url(link: str) -> str:
+    if not link:
+        return ""
+    if link.startswith("http://") or link.startswith("https://"):
+        return link
+    return f"https://www.realtor.ca{link}"
+
+
 def collect_listing_links(page: Page, max_scroll_rounds: int = 35, pause: float = 0.75) -> List[str]:
     listing_links: Set[str] = set()
+    captured_response_urls: Set[str] = set()
 
-    def discover_links() -> None:
+    def capture_from_response(response) -> None:
+        if "PropertySearch_Post" not in response.url:
+            return
+        try:
+            payload = response.json()
+        except Exception:
+            return
+
+        if not isinstance(payload, dict):
+            return
+        results = payload.get("Results") or []
+        for item in results:
+            if not isinstance(item, dict):
+                continue
+            rel = item.get("RelativeURLEn") or item.get("RelativeURL")
+            if rel:
+                listing_links.add(_normalize_listing_url(rel))
+        captured_response_urls.add(response.url)
+
+    def discover_links_from_dom() -> None:
         hrefs = page.eval_on_selector_all(
             "a[href*='/real-estate/']",
-            "els => els.map(e => e.href).filter(Boolean)",
+            "els => els.map(e => e.getAttribute('href') || e.href).filter(Boolean)",
         )
-        listing_links.update(hrefs)
+        for href in hrefs:
+            if "/real-estate/" in href:
+                listing_links.add(_normalize_listing_url(href))
 
+    page.on("response", capture_from_response)
     page.wait_for_timeout(3000)
-    discover_links()
+    discover_links_from_dom()
 
     for _ in range(max_scroll_rounds):
-        page.evaluate(
-            """
-            () => {
-              const scrollables = [...document.querySelectorAll('*')]
-                .filter(el => el.scrollHeight > el.clientHeight + 100);
-              for (const el of scrollables) {
-                el.scrollBy(0, 800);
-              }
-              window.scrollBy(0, 800);
-            }
-            """
-        )
+        page.mouse.move(360, 520)
+        page.mouse.wheel(0, 1300)
+        page.evaluate("window.scrollBy(0, 500)")
         time.sleep(pause)
-        discover_links()
+        discover_links_from_dom()
+
+    # Fallback: scan raw HTML for relative listing links if DOM query finds nothing.
+    if not listing_links:
+        content = page.content()
+        for match in re.findall(r"\\/real-estate\\/\\d+\\/[^\"'\\\\<]+", content):
+            listing_links.add(_normalize_listing_url(match.replace("\\/", "/")))
+
+    page.remove_listener("response", capture_from_response)
+    if not listing_links:
+        details = {
+            "captured_search_calls": len(captured_response_urls),
+            "current_url": page.url,
+        }
+        raise RuntimeError(
+            "No listing links found from map page. "
+            f"Debug details: {json.dumps(details)}"
+        )
 
     return sorted(link for link in listing_links if "/real-estate/" in link)
 
