@@ -11,7 +11,7 @@ from dataclasses import dataclass, asdict
 from typing import Dict, List, Set
 
 import pandas as pd
-from playwright.sync_api import Browser, Page, TimeoutError, sync_playwright
+from playwright.sync_api import Browser, Frame, Page, TimeoutError, sync_playwright
 
 DEFAULT_URL = (
     "https://www.realtor.ca/map#ZoomLevel=11&Center=49.162262%2C-122.742322"
@@ -122,37 +122,54 @@ def collect_listing_links(
                 listing_links.add(_normalize_listing_url(rel))
         captured_response_urls.add(response.url)
 
-    def discover_links_from_dom() -> None:
-        hrefs = page.eval_on_selector_all(
-            "a[href*='/real-estate/']",
-            "els => els.map(e => e.getAttribute('href') || e.href).filter(Boolean)",
-        )
+    def each_frame() -> List[Frame]:
+        return [page.main_frame] + [f for f in page.frames if f != page.main_frame]
+
+    def collect_hrefs_from_frame(frame: Frame, selector: str) -> None:
+        try:
+            hrefs = frame.eval_on_selector_all(
+                selector,
+                "els => els.map(e => e.getAttribute('href') || e.href).filter(Boolean)",
+            )
+        except Exception:
+            return
         for href in hrefs:
             if "/real-estate/" in href:
                 listing_links.add(_normalize_listing_url(href))
 
+    def discover_links_from_dom() -> None:
+        for frame in each_frame():
+            collect_hrefs_from_frame(frame, "a[href*='/real-estate/']")
+
     def discover_links_from_cards() -> None:
-        # Sidebar/card selectors and xpath supplied by user examples.
-        hrefs = page.eval_on_selector_all(
-            "#mapSidebarBodyCon .cardCon a[href*='/real-estate/'], .cardCon a[href*='/real-estate/']",
-            "els => els.map(e => e.getAttribute('href') || e.href).filter(Boolean)",
-        )
-        for href in hrefs:
-            if "/real-estate/" in href:
-                listing_links.add(_normalize_listing_url(href))
+        # Sidebar/card selectors and CSS supplied by user examples.
+        selectors = [
+            "#mapSidebarBodyCon .cardCon a[href*='/real-estate/']",
+            ".cardCon a[href*='/real-estate/']",
+            "div.cardCon > span > div > a[href*='/real-estate/']",
+            # User-provided CSS path shape (without brittle nth-child indexes for every node).
+            "div.cardCon a > div > div > div",
+        ]
+        for frame in each_frame():
+            for selector in selectors:
+                collect_hrefs_from_frame(frame, selector)
 
     def discover_links_from_xpath() -> None:
         xpath_selectors = [
             "xpath=//div[@id='mapSidebarBodyCon']//a[contains(@href, '/real-estate/')]",
             "xpath=/html/body/form/div[5]/div[2]/span/div/div[3]/div/div[1]/div[2]/div[3]/div[1]/span/div/a",
         ]
-        for selector in xpath_selectors:
-            anchors = page.locator(selector)
-            count = anchors.count()
-            for i in range(count):
-                href = anchors.nth(i).get_attribute("href") or ""
-                if "/real-estate/" in href:
-                    listing_links.add(_normalize_listing_url(href))
+        for frame in each_frame():
+            for selector in xpath_selectors:
+                try:
+                    anchors = frame.locator(selector)
+                    count = anchors.count()
+                except Exception:
+                    continue
+                for i in range(count):
+                    href = anchors.nth(i).get_attribute("href") or ""
+                    if "/real-estate/" in href:
+                        listing_links.add(_normalize_listing_url(href))
 
     def click_next_page() -> bool:
         next_xpath_candidates = [
@@ -161,37 +178,47 @@ def collect_listing_links(
             "xpath=//div[@id='mapSidebarBodyCon']/following::i[contains(@class,'fa-angle-right')][1]",
             "xpath=//i[contains(@class,'fa-angle-right')]",
         ]
-        for selector in next_xpath_candidates:
-            loc = page.locator(selector).first
-            if loc.count() == 0:
-                continue
-            try:
-                loc.click(timeout=1500, force=True)
-                return True
-            except Exception:
-                continue
+        for frame in each_frame():
+            for selector in next_xpath_candidates:
+                try:
+                    loc = frame.locator(selector).first
+                    if loc.count() == 0:
+                        continue
+                    loc.click(timeout=1500, force=True)
+                    return True
+                except Exception:
+                    continue
         return False
 
     page.on("response", capture_from_response)
-    page.wait_for_timeout(5000)
+    page.wait_for_timeout(3000)
+    # Give the result list time to initialize in dynamic/anti-bot scenarios.
+    try:
+        page.wait_for_selector(".cardCon, #mapSidebarBodyCon, a[href*='/real-estate/']", timeout=15000)
+    except Exception:
+        pass
     discover_links_from_dom()
     discover_links_from_cards()
     discover_links_from_xpath()
 
     for _ in range(max_page_turns):
         for _ in range(max_scroll_rounds):
-            page.evaluate(
-                """
-                () => {
-                  const sidebar = document.querySelector('#mapSidebarBodyCon');
-                  if (sidebar) {
-                    sidebar.scrollTop = sidebar.scrollTop + 1200;
-                  } else {
-                    window.scrollBy(0, 600);
-                  }
-                }
-                """
-            )
+            for frame in each_frame():
+                try:
+                    frame.evaluate(
+                        """
+                        () => {
+                          const sidebar = document.querySelector('#mapSidebarBodyCon');
+                          if (sidebar) {
+                            sidebar.scrollTop = sidebar.scrollTop + 1200;
+                          } else {
+                            window.scrollBy(0, 600);
+                          }
+                        }
+                        """
+                    )
+                except Exception:
+                    continue
             time.sleep(pause)
             discover_links_from_cards()
             discover_links_from_dom()
@@ -271,9 +298,9 @@ def scrape_listing(browser: Browser, url: str, timeout: int = 35000) -> Dict[str
         page.close()
 
 
-def run(start_url: str, out_file: str, max_listings: int | None = None) -> None:
+def run(start_url: str, out_file: str, max_listings: int | None = None, headless: bool = False) -> None:
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=headless)
         page = browser.new_page()
         page.goto(start_url, wait_until="domcontentloaded", timeout=45000)
         links = collect_listing_links(page)
@@ -284,7 +311,7 @@ def run(start_url: str, out_file: str, max_listings: int | None = None) -> None:
 
     rows: List[Dict[str, object]] = []
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=headless)
         for idx, link in enumerate(links, start=1):
             try:
                 print(f"[{idx}/{len(links)}] Scraping {link}")
@@ -310,9 +337,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", default=DEFAULT_URL, help="Map search URL containing your criteria")
     parser.add_argument("--output", default="realtor_listings.xlsx", help="Output Excel file path")
     parser.add_argument("--max-listings", type=int, default=None, help="Optional cap for number of listings")
+    parser.add_argument("--headless", action="store_true", help="Run browser headless (default: headed)")
     return parser
 
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    run(start_url=args.url, out_file=args.output, max_listings=args.max_listings)
+    run(start_url=args.url, out_file=args.output, max_listings=args.max_listings, headless=args.headless)

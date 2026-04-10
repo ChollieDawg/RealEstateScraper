@@ -19,6 +19,8 @@ python scraper.py \
   --output realtor_listings.xlsx
 ```
 
+By default the script runs in headed mode (visible browser) for better compatibility with Realtor dynamic rendering. Use `--headless` if you want background execution.
+
 Optional limit for quick trial:
 
 ```bash
