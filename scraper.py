@@ -86,6 +86,104 @@ def matches_keywords(text: str) -> Dict[str, bool]:
     return output
 
 
+def _extract_first_money_value(text: str) -> str:
+    # Matches values like $649,000 or CAD 649,000
+    patterns = [
+        r"(?:CAD|\\$)\\s?\\d{1,3}(?:,\\d{3})+(?:\\.\\d{2})?",
+        r"\\$\\s?\\d+(?:\\.\\d{2})?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, flags=re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+    return ""
+
+
+def extract_structured_fields(page: Page, body_text: str) -> Dict[str, str]:
+    """
+    Extract key fields from listing structured data and common visual selectors.
+    This improves reliability when plain text labels are noisy.
+    """
+    fields = {"price": "", "address": ""}
+
+    # 1) JSON-LD structured data (preferred)
+    scripts = page.locator("script[type='application/ld+json']")
+    for i in range(scripts.count()):
+        raw = scripts.nth(i).inner_text().strip()
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        candidates = data if isinstance(data, list) else [data]
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            offers = item.get("offers") or {}
+            address_obj = item.get("address") or {}
+
+            if not fields["price"]:
+                if isinstance(offers, dict):
+                    price_val = offers.get("price")
+                    price_currency = offers.get("priceCurrency")
+                    if price_val:
+                        fields["price"] = f"{price_currency} {price_val}".strip()
+
+            if not fields["address"] and isinstance(address_obj, dict):
+                parts = [
+                    address_obj.get("streetAddress", ""),
+                    address_obj.get("addressLocality", ""),
+                    address_obj.get("addressRegion", ""),
+                ]
+                address = ", ".join([p for p in parts if p]).strip(", ")
+                if address:
+                    fields["address"] = address
+
+    # 2) Visual selector fallbacks
+    if not fields["price"]:
+        price_selectors = [
+            "[data-testid*='price']",
+            ".listingPrice",
+            ".price",
+            "h2:has-text('$')",
+            "h1:has-text('$')",
+        ]
+        for selector in price_selectors:
+            try:
+                text = page.locator(selector).first.inner_text(timeout=800)
+            except Exception:
+                continue
+            money = _extract_first_money_value(text)
+            if money:
+                fields["price"] = money
+                break
+
+    if not fields["address"]:
+        address_selectors = [
+            "[data-testid*='address']",
+            ".listingAddress",
+            "h1",
+        ]
+        for selector in address_selectors:
+            try:
+                text = page.locator(selector).first.inner_text(timeout=800).strip()
+            except Exception:
+                continue
+            if text and "sale history" not in text.lower():
+                fields["address"] = re.sub(r"\\s+", " ", text)
+                break
+
+    # 3) Text-label and regex fallback
+    if not fields["address"]:
+        fields["address"] = extract_value(body_text, "Address") or extract_value(body_text, "Location")
+    if not fields["price"]:
+        fields["price"] = extract_value(body_text, "Price") or _extract_first_money_value(body_text)
+
+    return fields
+
+
 def _normalize_listing_url(link: str) -> str:
     if not link:
         return ""
@@ -267,6 +365,7 @@ def scrape_listing(browser: Browser, url: str, timeout: int = 35000) -> Dict[str
         title = page.title() or ""
         text = page.locator("body").inner_text(timeout=timeout)
         description = ""
+        structured = extract_structured_fields(page, text)
 
         try:
             description = page.locator("text=Listing Description").locator("xpath=following::p[1]").inner_text(timeout=2500)
@@ -278,8 +377,8 @@ def scrape_listing(browser: Browser, url: str, timeout: int = 35000) -> Dict[str
             listing_url=url,
             listing_id=listing_id_match.group(1) if listing_id_match else "",
             title=title.strip(),
-            address=extract_value(text, "Address") or extract_value(text, "Location"),
-            price=extract_value(text, "Price"),
+            address=structured.get("address", ""),
+            price=structured.get("price", ""),
             description=description.strip(),
             property_type=extract_value(text, "Property Type"),
             building_type=extract_value(text, "Building Type"),
