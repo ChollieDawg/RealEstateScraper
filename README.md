@@ -35,5 +35,6 @@ The Excel file includes:
 ## Notes
 
 - Realtor.ca is a dynamic site; selectors and field labels may change.
+- Link collection first tries Realtor's search API (from your map URL filters), then falls back to sidebar DOM scraping.
 - Some attributes are inferred via keyword matching from listing text and may be imperfect.
 - If needed, tune `KEYWORD_RULES` and scroll behavior in `scraper.py`.
