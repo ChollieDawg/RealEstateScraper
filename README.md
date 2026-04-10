@@ -8,7 +8,7 @@ Scrapes Realtor.ca listings from a criteria URL and exports data to Excel, inclu
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-playwright install chromium
+pip install -U undetected-chromedriver selenium
 ```
 
 ## Usage
@@ -37,7 +37,7 @@ The Excel file includes:
 ## Notes
 
 - Realtor.ca is a dynamic site; selectors and field labels may change.
-- Link collection uses Playwright sidebar/card scraping and pagination; tune selectors/xpaths if Realtor.ca updates markup.
+- Link collection uses Selenium + undetected-chromedriver sidebar/card scraping and pagination; tune selectors/xpaths if Realtor.ca updates markup.
 - The scraper uses structured data (`application/ld+json`) plus selector/text fallbacks for more reliable price/address extraction.
 - Some attributes are inferred via keyword matching from listing text and may be imperfect.
 - If needed, tune `KEYWORD_RULES` and scroll behavior in `scraper.py`.

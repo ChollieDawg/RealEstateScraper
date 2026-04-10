@@ -1,3 +1,5 @@
 pandas
 openpyxl
-playwright
+undetected-chromedriver
+selenium
+beautifulsoup4
