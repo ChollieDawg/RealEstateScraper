@@ -94,7 +94,12 @@ def _normalize_listing_url(link: str) -> str:
     return f"https://www.realtor.ca{link}"
 
 
-def collect_listing_links(page: Page, max_scroll_rounds: int = 35, pause: float = 0.75) -> List[str]:
+def collect_listing_links(
+    page: Page,
+    max_scroll_rounds: int = 20,
+    max_page_turns: int = 25,
+    pause: float = 0.75,
+) -> List[str]:
     listing_links: Set[str] = set()
     captured_response_urls: Set[str] = set()
 
@@ -126,16 +131,61 @@ def collect_listing_links(page: Page, max_scroll_rounds: int = 35, pause: float 
             if "/real-estate/" in href:
                 listing_links.add(_normalize_listing_url(href))
 
+    def discover_links_from_cards() -> None:
+        # Realtor card container supplied by user example.
+        hrefs = page.eval_on_selector_all(
+            ".cardCon a[href*='/real-estate/']",
+            "els => els.map(e => e.getAttribute('href') || e.href).filter(Boolean)",
+        )
+        for href in hrefs:
+            if "/real-estate/" in href:
+                listing_links.add(_normalize_listing_url(href))
+
+    def click_next_page() -> bool:
+        # Realtor next-page icon supplied by user example:
+        # <i class=\"fa fa-angle-right\"></i>
+        return bool(
+            page.evaluate(
+                """
+                () => {
+                  const icons = [...document.querySelectorAll('i.fa.fa-angle-right')];
+                  for (const icon of icons) {
+                    const clickable = icon.closest('button, a, li, div, span');
+                    if (!clickable) continue;
+                    const attrs = (
+                      (clickable.getAttribute('class') || '') + ' ' +
+                      (clickable.getAttribute('aria-disabled') || '') + ' ' +
+                      (clickable.getAttribute('disabled') || '')
+                    ).toLowerCase();
+                    if (attrs.includes('disabled') || attrs.includes('true')) continue;
+                    clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
+                    return true;
+                  }
+                  return false;
+                }
+                """
+            )
+        )
+
     page.on("response", capture_from_response)
     page.wait_for_timeout(3000)
     discover_links_from_dom()
+    discover_links_from_cards()
 
-    for _ in range(max_scroll_rounds):
-        page.mouse.move(360, 520)
-        page.mouse.wheel(0, 1300)
-        page.evaluate("window.scrollBy(0, 500)")
-        time.sleep(pause)
+    for _ in range(max_page_turns):
+        for _ in range(max_scroll_rounds):
+            page.mouse.move(360, 520)
+            page.mouse.wheel(0, 1300)
+            page.evaluate("window.scrollBy(0, 500)")
+            time.sleep(pause)
+            discover_links_from_cards()
+            discover_links_from_dom()
+
+        if not click_next_page():
+            break
+        page.wait_for_timeout(2000)
         discover_links_from_dom()
+        discover_links_from_cards()
 
     # Fallback: scan raw HTML for relative listing links if DOM query finds nothing.
     if not listing_links:
@@ -145,9 +195,11 @@ def collect_listing_links(page: Page, max_scroll_rounds: int = 35, pause: float 
 
     page.remove_listener("response", capture_from_response)
     if not listing_links:
+        card_count = page.locator(".cardCon").count()
         details = {
             "captured_search_calls": len(captured_response_urls),
             "current_url": page.url,
+            "card_containers_found": card_count,
         }
         raise RuntimeError(
             "No listing links found from map page. "
