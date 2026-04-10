@@ -9,10 +9,8 @@ import re
 import time
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Set
-from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
-import requests
 from playwright.sync_api import Browser, Page, TimeoutError, sync_playwright
 
 DEFAULT_URL = (
@@ -96,69 +94,6 @@ def _normalize_listing_url(link: str) -> str:
     return f"https://www.realtor.ca{link}"
 
 
-def _extract_hash_filters(start_url: str) -> Dict[str, str]:
-    parsed = urlparse(start_url)
-    hash_part = parsed.fragment or ""
-    params = parse_qs(hash_part, keep_blank_values=True)
-    return {k: v[0] for k, v in params.items() if v}
-
-
-def collect_listing_links_via_api(start_url: str, max_pages: int = 30) -> List[str]:
-    """
-    Fallback-independent link collection using Realtor's search API.
-    This avoids brittle DOM selectors when map/sidebar markup changes.
-    """
-    filters = _extract_hash_filters(start_url)
-    endpoint = "https://api2.realtor.ca/Listing.svc/PropertySearch_Post"
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json, text/javascript, */*; q=0.01",
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-        "Origin": "https://www.realtor.ca",
-        "Referer": "https://www.realtor.ca/",
-        "X-Requested-With": "XMLHttpRequest",
-    }
-
-    links: Set[str] = set()
-    for page_num in range(1, max_pages + 1):
-        payload = {
-            "ApplicationId": "1",
-            "CultureId": "1",
-            "Version": "7.0",
-            "CurrentPage": str(page_num),
-            "RecordsPerPage": "200",
-            "Sort": filters.get("Sort", "6-D"),
-            "PropertySearchTypeId": filters.get("PropertySearchTypeId", "0"),
-            "TransactionTypeId": filters.get("TransactionTypeId", "2"),
-            "PropertyTypeGroupID": filters.get("PropertyTypeGroupID", "1"),
-            "LatitudeMin": filters.get("LatitudeMin", ""),
-            "LatitudeMax": filters.get("LatitudeMax", ""),
-            "LongitudeMin": filters.get("LongitudeMin", ""),
-            "LongitudeMax": filters.get("LongitudeMax", ""),
-            "PriceMin": filters.get("PriceMin", ""),
-            "PriceMax": filters.get("PriceMax", ""),
-            "BedRange": filters.get("BedRange", ""),
-            "BathRange": filters.get("BathRange", ""),
-            "Currency": filters.get("Currency", "CAD"),
-        }
-        response = requests.post(endpoint, data=payload, headers=headers, timeout=45)
-        response.raise_for_status()
-        data = response.json()
-        results = data.get("Results") or []
-        if not results:
-            break
-        page_links = 0
-        for item in results:
-            rel = item.get("RelativeURLEn") or item.get("RelativeURL")
-            if rel:
-                links.add(_normalize_listing_url(rel))
-                page_links += 1
-        if page_links == 0:
-            break
-
-    return sorted(link for link in links if "/real-estate/" in link)
-
-
 def collect_listing_links(
     page: Page,
     max_scroll_rounds: int = 20,
@@ -197,7 +132,7 @@ def collect_listing_links(
                 listing_links.add(_normalize_listing_url(href))
 
     def discover_links_from_cards() -> None:
-        # Realtor card container supplied by user example.
+        # Sidebar/card selectors and xpath supplied by user examples.
         hrefs = page.eval_on_selector_all(
             "#mapSidebarBodyCon .cardCon a[href*='/real-estate/'], .cardCon a[href*='/real-estate/']",
             "els => els.map(e => e.getAttribute('href') || e.href).filter(Boolean)",
@@ -206,36 +141,42 @@ def collect_listing_links(
             if "/real-estate/" in href:
                 listing_links.add(_normalize_listing_url(href))
 
+    def discover_links_from_xpath() -> None:
+        xpath_selectors = [
+            "xpath=//div[@id='mapSidebarBodyCon']//a[contains(@href, '/real-estate/')]",
+            "xpath=/html/body/form/div[5]/div[2]/span/div/div[3]/div/div[1]/div[2]/div[3]/div[1]/span/div/a",
+        ]
+        for selector in xpath_selectors:
+            anchors = page.locator(selector)
+            count = anchors.count()
+            for i in range(count):
+                href = anchors.nth(i).get_attribute("href") or ""
+                if "/real-estate/" in href:
+                    listing_links.add(_normalize_listing_url(href))
+
     def click_next_page() -> bool:
-        # Realtor next-page icon supplied by user example:
-        # <i class=\"fa fa-angle-right\"></i>
-        return bool(
-            page.evaluate(
-                """
-                () => {
-                  const icons = [...document.querySelectorAll('i.fa.fa-angle-right')];
-                  for (const icon of icons) {
-                    const clickable = icon.closest('button, a, li, div, span');
-                    if (!clickable) continue;
-                    const attrs = (
-                      (clickable.getAttribute('class') || '') + ' ' +
-                      (clickable.getAttribute('aria-disabled') || '') + ' ' +
-                      (clickable.getAttribute('disabled') || '')
-                    ).toLowerCase();
-                    if (attrs.includes('disabled') || attrs.includes('true')) continue;
-                    clickable.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }));
-                    return true;
-                  }
-                  return false;
-                }
-                """
-            )
-        )
+        next_xpath_candidates = [
+            "xpath=/html/body/form/div[5]/div[2]/span/div/div[3]/div/div[1]/div[2]/div[4]/span/div/a[3]",
+            "xpath=/html/body/form/div[5]/div[2]/span/div/div[3]/div/div[1]/div[2]/div[4]/span/div/a[3]/div",
+            "xpath=//div[@id='mapSidebarBodyCon']/following::i[contains(@class,'fa-angle-right')][1]",
+            "xpath=//i[contains(@class,'fa-angle-right')]",
+        ]
+        for selector in next_xpath_candidates:
+            loc = page.locator(selector).first
+            if loc.count() == 0:
+                continue
+            try:
+                loc.click(timeout=1500, force=True)
+                return True
+            except Exception:
+                continue
+        return False
 
     page.on("response", capture_from_response)
     page.wait_for_timeout(5000)
     discover_links_from_dom()
     discover_links_from_cards()
+    discover_links_from_xpath()
 
     for _ in range(max_page_turns):
         for _ in range(max_scroll_rounds):
@@ -254,12 +195,14 @@ def collect_listing_links(
             time.sleep(pause)
             discover_links_from_cards()
             discover_links_from_dom()
+            discover_links_from_xpath()
 
         if not click_next_page():
             break
         page.wait_for_timeout(2000)
         discover_links_from_dom()
         discover_links_from_cards()
+        discover_links_from_xpath()
 
     # Fallback: scan raw HTML for relative listing links if DOM query finds nothing.
     if not listing_links:
@@ -274,6 +217,10 @@ def collect_listing_links(
             "captured_search_calls": len(captured_response_urls),
             "current_url": page.url,
             "card_containers_found": card_count,
+            "sidebar_found": page.locator("#mapSidebarBodyCon").count(),
+            "xpath_listing_anchors_found": page.locator(
+                "xpath=//div[@id='mapSidebarBodyCon']//a[contains(@href, '/real-estate/')]"
+            ).count(),
         }
         raise RuntimeError(
             "No listing links found from map page. "
@@ -325,23 +272,12 @@ def scrape_listing(browser: Browser, url: str, timeout: int = 35000) -> Dict[str
 
 
 def run(start_url: str, out_file: str, max_listings: int | None = None) -> None:
-    links: List[str] = []
-
-    # Primary approach: API-based collection (most stable against DOM changes)
-    try:
-        links = collect_listing_links_via_api(start_url)
-        print(f"Collected {len(links)} listing links via API.")
-    except Exception as exc:
-        print(f"API link collection failed: {exc}")
-
-    # Fallback approach: browser/sidebar scraping
-    if not links:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(start_url, wait_until="domcontentloaded", timeout=45000)
-            links = collect_listing_links(page)
-            browser.close()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(start_url, wait_until="domcontentloaded", timeout=45000)
+        links = collect_listing_links(page)
+        browser.close()
 
     if max_listings:
         links = links[:max_listings]
