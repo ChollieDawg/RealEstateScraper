@@ -151,21 +151,31 @@ def collect_current_page_links(driver: uc.Chrome) -> List[str]:
     links: List[str] = []
     seen: Set[str] = set()
 
+    def add_links_from_selector(selector: str) -> None:
+        try:
+            hrefs = driver.execute_script(
+                """
+                const selector = arguments[0];
+                return [...document.querySelectorAll(selector)]
+                  .map(el => el.getAttribute('href') || el.href || '')
+                  .filter(Boolean);
+                """,
+                selector,
+            ) or []
+        except Exception:
+            hrefs = []
+        for href in hrefs:
+            normalized = _normalize_listing_url(href)
+            if "/real-estate/" in normalized and normalized not in seen:
+                seen.add(normalized)
+                links.append(normalized)
+
     # Explicit left-side card slots requested by user: div.cardCon:nth-child(1..13)
     for i in range(1, 14):
-        selector = f"div.cardCon:nth-child({i}) a[href*='/real-estate/']"
-        for el in driver.find_elements(By.CSS_SELECTOR, selector):
-            href = _normalize_listing_url(el.get_attribute("href") or "")
-            if "/real-estate/" in href and href not in seen:
-                seen.add(href)
-                links.append(href)
+        add_links_from_selector(f"div.cardCon:nth-child({i}) a[href*='/real-estate/']")
 
     # Fallback: any visible card links on current page.
-    for el in driver.find_elements(By.CSS_SELECTOR, "div.cardCon a[href*='/real-estate/']"):
-        href = _normalize_listing_url(el.get_attribute("href") or "")
-        if "/real-estate/" in href and href not in seen:
-            seen.add(href)
-            links.append(href)
+    add_links_from_selector("div.cardCon a[href*='/real-estate/']")
 
     log(f"Found {len(links)} listing link(s) on current sidebar page.")
     return links
@@ -391,6 +401,13 @@ def run(
                 break
             pages_processed += 1
             time.sleep(2.0)
+            # Post-pagination settle to avoid stale/transition states.
+            retry_deadline = time.time() + 10
+            while time.time() < retry_deadline:
+                probe_links = collect_current_page_links(driver)
+                if probe_links:
+                    break
+                time.sleep(0.8)
 
         if not rows:
             log("No listing rows were scraped. Writing empty workbook for visibility.")
