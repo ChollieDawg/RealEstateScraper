@@ -135,6 +135,13 @@ def _extract_first_money_value(text: str) -> str:
 def _parse_currency_to_float(value: str) -> float | None:
     if not value:
         return None
+    cleaned = re.sub(r"[^0-9.]", "", value)
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
 
 
 def _parse_time_on_realtor_days(value: str) -> int | None:
@@ -169,9 +176,17 @@ def _parse_built_in_year(value: str, fallback_text: str = "", reference_year: in
 
 
 def _infer_city(address: str, body_text: str = "") -> str:
-    haystack = f"{address}\n{body_text}".lower()
-    for city in KNOWN_CITIES:
-        if city.lower() in haystack:
+    # Prefer parsing directly from listing address to avoid false matches like "Metro Vancouver".
+    lines = [ln.strip() for ln in (address or "").splitlines() if ln.strip()]
+    locality_line = lines[-1] if lines else address
+    locality_line = (locality_line or "").lower()
+    for city in sorted(KNOWN_CITIES, key=len, reverse=True):
+        if city.lower() in locality_line:
+            return city
+    # Fallback only if address parsing fails.
+    haystack = (body_text or "").lower()
+    for city in sorted(KNOWN_CITIES, key=len, reverse=True):
+        if re.search(rf"\\b{re.escape(city.lower())}\\b", haystack):
             return city
     return ""
 
@@ -187,13 +202,6 @@ def _parse_open_house_date_2026(month_text: str, day_text: str) -> str:
         return dt.date(2026, month_num, day_num).isoformat()
     except Exception:
         return ""
-    cleaned = re.sub(r"[^0-9.]", "", value)
-    if not cleaned:
-        return None
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
 
 
 def _parse_sqft_to_float(value: str) -> float | None:
