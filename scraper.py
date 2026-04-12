@@ -188,6 +188,36 @@ def click_next_page(driver: uc.Chrome) -> bool:
         return False
 
 
+def wait_for_initial_sidebar_links(
+    driver: uc.Chrome,
+    initial_timeout_sec: int = 45,
+    poll_interval_sec: float = 1.5,
+) -> List[str]:
+    log(f"Waiting up to {initial_timeout_sec}s for initial sidebar listings to render...")
+    deadline = time.time() + initial_timeout_sec
+    attempts = 0
+    while time.time() < deadline:
+        attempts += 1
+        links = collect_current_page_links(driver)
+        if links:
+            log(f"Initial listings detected after {attempts} checks.")
+            return links
+        # Nudge map/sidebar in case lazy-render did not trigger yet.
+        try:
+            driver.execute_script(
+                """
+                const sidebar = document.querySelector('#mapSidebarBodyCon');
+                if (sidebar) sidebar.scrollTop += 300;
+                window.scrollBy(0, 100);
+                """
+            )
+        except Exception:
+            pass
+        time.sleep(poll_interval_sec)
+    log("Initial sidebar listings did not appear before timeout.")
+    return []
+
+
 def _text_or_empty(driver: uc.Chrome, css_selector: str) -> str:
     els = driver.find_elements(By.CSS_SELECTOR, css_selector)
     if not els:
@@ -257,15 +287,19 @@ def run(
         log(f"Opening start URL: {start_url}")
         driver.get(start_url)
         WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(3)
+        time.sleep(5)
         log("Map page loaded. Starting sidebar iteration.")
 
         seen_links: Set[str] = set()
         rows: List[Dict[str, object]] = []
         pages_processed = 0
+        initial_links = wait_for_initial_sidebar_links(driver)
+        if not initial_links:
+            log("No initial links found yet; continuing with pagination loop for additional retries.")
+
         while pages_processed < max_pages:
             log(f"Processing sidebar page index {pages_processed + 1}.")
-            current_links = collect_current_page_links(driver)
+            current_links = initial_links if pages_processed == 0 and initial_links else collect_current_page_links(driver)
             if not current_links:
                 log("No links found on this page; stopping.")
                 break
@@ -308,7 +342,9 @@ def run(
             time.sleep(2.0)
 
         if not rows:
-            raise RuntimeError("No listing rows were scraped.")
+            log("No listing rows were scraped. Writing empty workbook for visibility.")
+            pd.DataFrame([{"listing_url": "", "error": "No listing rows were scraped."}]).to_excel(out_file, index=False)
+            return
 
         df = pd.DataFrame(rows)
         link_col = df.pop("listing_url")
@@ -317,7 +353,10 @@ def run(
         log(f"Final write complete. Wrote {len(df)} rows to {out_file}")
     finally:
         log("Closing browser.")
-        driver.quit()
+        try:
+            driver.quit()
+        except OSError as exc:
+            log(f"Ignoring browser shutdown handle error: {exc}")
 
 
 def build_parser() -> argparse.ArgumentParser:

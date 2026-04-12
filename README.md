@@ -55,3 +55,4 @@ The Excel file includes:
 - Some attributes are inferred via keyword matching from listing text and may be imperfect.
 - If needed, tune `KEYWORD_RULES` and scroll behavior in `scraper.py`.
 - Terminal logs include page index, links found, scrape success/fail status, next-page clicks, and autosave checkpoints.
+- On startup, the scraper now waits/retries for initial sidebar listings to render before proceeding.
