@@ -33,6 +33,12 @@ Optional page cap while iterating sidebar pagination:
 python scraper.py --max-pages 50
 ```
 
+Autosave progress every N rows (useful for long runs and live verification):
+
+```bash
+python scraper.py --autosave-every 5
+```
+
 ## Output
 
 The Excel file includes:
@@ -48,3 +54,4 @@ The Excel file includes:
 - The scraper uses structured data (`application/ld+json`) plus selector/text fallbacks for more reliable price/address extraction.
 - Some attributes are inferred via keyword matching from listing text and may be imperfect.
 - If needed, tune `KEYWORD_RULES` and scroll behavior in `scraper.py`.
+- Terminal logs include page index, links found, scrape success/fail status, next-page clicks, and autosave checkpoints.

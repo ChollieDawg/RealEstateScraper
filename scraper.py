@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime as dt
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -84,6 +85,11 @@ def build_driver(headless: bool) -> uc.Chrome:
     return uc.Chrome(options=options)
 
 
+def log(message: str) -> None:
+    ts = dt.datetime.now().strftime("%H:%M:%S")
+    print(f"[{ts}] {message}", flush=True)
+
+
 def _normalize_listing_url(link: str) -> str:
     if not link:
         return ""
@@ -155,6 +161,7 @@ def collect_current_page_links(driver: uc.Chrome) -> List[str]:
             seen.add(href)
             links.append(href)
 
+    log(f"Found {len(links)} listing link(s) on current sidebar page.")
     return links
 
 
@@ -162,6 +169,7 @@ def click_next_page(driver: uc.Chrome) -> bool:
     selector = "#SideBarPagination > div:nth-child(1) > a:nth-child(4) > div:nth-child(1) > i:nth-child(1)"
     icons = driver.find_elements(By.CSS_SELECTOR, selector)
     if not icons:
+        log("Next-page button not found; pagination is exhausted.")
         return False
     try:
         driver.execute_script(
@@ -173,8 +181,10 @@ def click_next_page(driver: uc.Chrome) -> bool:
             """,
             icons[0],
         )
+        log("Clicked next-page button.")
         return True
     except Exception:
+        log("Failed to click next-page button.")
         return False
 
 
@@ -186,6 +196,7 @@ def _text_or_empty(driver: uc.Chrome, css_selector: str) -> str:
 
 
 def scrape_listing(driver: uc.Chrome, url: str) -> Dict[str, object]:
+    log(f"Scraping listing detail: {url}")
     time.sleep(1.8)
     body_text = driver.find_element(By.TAG_NAME, "body").text
     description = _text_or_empty(driver, "#propertyDescriptionCon")
@@ -224,6 +235,12 @@ def scrape_listing(driver: uc.Chrome, url: str) -> Dict[str, object]:
     row["price_per_sqft"] = (price_num / sqft_num) if (price_num and sqft_num and sqft_num > 0) else None
 
     row.update(matches_keywords(body_text + "\n" + description))
+    log(
+        "Scraped fields: "
+        f"address={'yes' if row.get('address') else 'no'}, "
+        f"price={'yes' if row.get('price') else 'no'}, "
+        f"sqft={'yes' if row.get('square_footage') else 'no'}"
+    )
     return row
 
 
@@ -233,40 +250,55 @@ def run(
     max_listings: int | None = None,
     headless: bool = False,
     max_pages: int = 200,
+    autosave_every: int = 10,
 ) -> None:
     driver = build_driver(headless=headless)
     try:
+        log(f"Opening start URL: {start_url}")
         driver.get(start_url)
         WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(3)
+        log("Map page loaded. Starting sidebar iteration.")
 
         seen_links: Set[str] = set()
         rows: List[Dict[str, object]] = []
         pages_processed = 0
         while pages_processed < max_pages:
+            log(f"Processing sidebar page index {pages_processed + 1}.")
             current_links = collect_current_page_links(driver)
             if not current_links:
+                log("No links found on this page; stopping.")
                 break
 
             for link in current_links:
                 if link in seen_links:
+                    log(f"Skipping duplicate link: {link}")
                     continue
                 seen_links.add(link)
                 if max_listings and len(rows) >= max_listings:
+                    log(f"Reached max-listings limit: {max_listings}")
                     break
                 try:
-                    print(f"[{len(rows)+1}] Scraping {link}")
+                    log(f"[{len(rows)+1}] Opening in new tab: {link}")
                     driver.execute_script("window.open(arguments[0], '_blank');", link)
                     driver.switch_to.window(driver.window_handles[-1])
                     rows.append(scrape_listing(driver, link))
+                    log(f"Rows collected so far: {len(rows)}")
+                    if autosave_every > 0 and len(rows) % autosave_every == 0:
+                        df_partial = pd.DataFrame(rows)
+                        link_col = df_partial.pop("listing_url")
+                        df_partial.insert(0, "listing_url", link_col)
+                        df_partial.to_excel(out_file, index=False)
+                        log(f"Autosaved partial output ({len(rows)} rows) to {out_file}")
                 except TimeoutException:
-                    print(f"Timeout while scraping {link}")
+                    log(f"Timeout while scraping {link}")
                 except Exception as exc:
-                    print(f"Error scraping {link}: {exc}")
+                    log(f"Error scraping {link}: {exc}")
                 finally:
                     if len(driver.window_handles) > 1:
                         driver.close()
                         driver.switch_to.window(driver.window_handles[0])
+                        log("Closed listing tab and returned to results tab.")
 
             if max_listings and len(rows) >= max_listings:
                 break
@@ -282,8 +314,9 @@ def run(
         link_col = df.pop("listing_url")
         df.insert(0, "listing_url", link_col)
         df.to_excel(out_file, index=False)
-        print(f"Wrote {len(df)} rows to {out_file}")
+        log(f"Final write complete. Wrote {len(df)} rows to {out_file}")
     finally:
+        log("Closing browser.")
         driver.quit()
 
 
@@ -293,6 +326,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", default="realtor_listings.xlsx", help="Output Excel file path")
     parser.add_argument("--max-listings", type=int, default=None, help="Optional cap for number of listings")
     parser.add_argument("--max-pages", type=int, default=200, help="Maximum number of sidebar pages to process")
+    parser.add_argument("--autosave-every", type=int, default=10, help="Autosave Excel every N rows (0 disables)")
     parser.add_argument("--headless", action="store_true", help="Run browser headless (default: headed)")
     return parser
 
@@ -305,4 +339,5 @@ if __name__ == "__main__":
         max_listings=args.max_listings,
         headless=args.headless,
         max_pages=args.max_pages,
+        autosave_every=args.autosave_every,
     )
