@@ -82,7 +82,13 @@ def build_driver(headless: bool) -> uc.Chrome:
         options.add_argument("--headless=new")
     options.add_argument("--window-size=1400,2000")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    return uc.Chrome(options=options)
+    driver = uc.Chrome(options=options)
+    # Avoid undetected-chromedriver destructor double-quit noise on Windows.
+    try:
+        driver.__del__ = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    return driver
 
 
 def log(message: str) -> None:
@@ -318,8 +324,13 @@ def run(
         initial_links = wait_for_initial_sidebar_links(driver)
         if not initial_links:
             log("No initial links found yet; continuing with pagination loop for additional retries.")
+        main_handle = driver.current_window_handle
+        driver.execute_script("window.open('about:blank', '_blank');")
+        worker_handle = driver.window_handles[-1]
+        log("Opened dedicated worker tab for listing scrapes.")
 
         while pages_processed < max_pages:
+            driver.switch_to.window(main_handle)
             log(f"Processing sidebar page index {pages_processed + 1}.")
             current_links = initial_links if pages_processed == 0 and initial_links else collect_current_page_links(driver)
             if not current_links:
@@ -335,9 +346,8 @@ def run(
                     log(f"Reached max-listings limit: {max_listings}")
                     break
                 try:
-                    log(f"[{len(rows)+1}] Opening in new tab: {link}")
-                    driver.execute_script("window.open(arguments[0], '_blank');", link)
-                    driver.switch_to.window(driver.window_handles[-1])
+                    log(f"[{len(rows)+1}] Scraping in worker tab: {link}")
+                    driver.switch_to.window(worker_handle)
                     row = scrape_listing(driver, link)
                     if not row.get("address") and not row.get("description"):
                         log(f"Skipping row due to missing core fields for {link}")
@@ -355,13 +365,12 @@ def run(
                 except Exception as exc:
                     log(f"Error scraping {link}: {exc}")
                 finally:
-                    if len(driver.window_handles) > 1:
-                        driver.close()
-                        driver.switch_to.window(driver.window_handles[0])
-                        log("Closed listing tab and returned to results tab.")
+                    driver.switch_to.window(main_handle)
+                    log("Returned to results tab.")
 
             if max_listings and len(rows) >= max_listings:
                 break
+            driver.switch_to.window(main_handle)
             if not click_next_page(driver):
                 break
             pages_processed += 1
@@ -371,6 +380,16 @@ def run(
             log("No listing rows were scraped. Writing empty workbook for visibility.")
             pd.DataFrame([{"listing_url": "", "error": "No listing rows were scraped."}]).to_excel(out_file, index=False)
             return
+
+        # Close worker tab before final write to keep browser state clean.
+        if "worker_handle" in locals() and len(driver.window_handles) > 1:
+            try:
+                driver.switch_to.window(worker_handle)
+                driver.close()
+                driver.switch_to.window(main_handle)
+                log("Closed worker tab.")
+            except Exception:
+                pass
 
         df = pd.DataFrame(rows)
         link_col = df.pop("listing_url")
