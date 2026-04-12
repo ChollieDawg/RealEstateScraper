@@ -225,16 +225,38 @@ def _text_or_empty(driver: uc.Chrome, css_selector: str) -> str:
     return els[0].text.strip()
 
 
+def _wait_for_listing_page_ready(driver: uc.Chrome, timeout_sec: int = 25) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        has_address = bool(driver.find_elements(By.CSS_SELECTOR, "#listingAddress"))
+        has_price = bool(driver.find_elements(By.CSS_SELECTOR, "#listingPriceValue"))
+        has_description = bool(driver.find_elements(By.CSS_SELECTOR, "#propertyDescriptionCon"))
+        if has_address or has_price or has_description:
+            return True
+        time.sleep(0.5)
+    return False
+
+
 def scrape_listing(driver: uc.Chrome, url: str) -> Dict[str, object]:
     log(f"Scraping listing detail: {url}")
-    time.sleep(1.8)
+    # Always navigate explicitly in the tab to avoid stale/blocked new-tab loads.
+    driver.get(url)
+    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    ready = _wait_for_listing_page_ready(driver)
+    if not ready:
+        raise RuntimeError("Listing page did not expose expected selectors (#listingAddress/#listingPriceValue/#propertyDescriptionCon).")
+
+    listing_id_match = re.search(r"real-estate/(\d+)", url)
+    if listing_id_match and listing_id_match.group(1) not in driver.current_url:
+        log(f"Warning: current_url mismatch after navigation: {driver.current_url}")
+
+    log(f"Loaded listing page URL: {driver.current_url}")
     body_text = driver.find_element(By.TAG_NAME, "body").text
     description = _text_or_empty(driver, "#propertyDescriptionCon")
     address = _text_or_empty(driver, "#listingAddress") or extract_value(body_text, "Address")
     price = _text_or_empty(driver, "#listingPriceValue") or _extract_first_money_value(body_text)
     square_footage = _text_or_empty(driver, "#SquareFootageIcon > div:nth-child(2)") or extract_value(body_text, "Square Footage")
 
-    listing_id_match = re.search(r"real-estate/(\d+)", url)
     record = ListingRecord(
         listing_url=url,
         listing_id=listing_id_match.group(1) if listing_id_match else "",
@@ -316,7 +338,11 @@ def run(
                     log(f"[{len(rows)+1}] Opening in new tab: {link}")
                     driver.execute_script("window.open(arguments[0], '_blank');", link)
                     driver.switch_to.window(driver.window_handles[-1])
-                    rows.append(scrape_listing(driver, link))
+                    row = scrape_listing(driver, link)
+                    if not row.get("address") and not row.get("description"):
+                        log(f"Skipping row due to missing core fields for {link}")
+                    else:
+                        rows.append(row)
                     log(f"Rows collected so far: {len(rows)}")
                     if autosave_every > 0 and len(rows) % autosave_every == 0:
                         df_partial = pd.DataFrame(rows)
