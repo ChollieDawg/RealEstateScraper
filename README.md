@@ -45,6 +45,7 @@ The Excel file includes:
 - `listing_url`
 - core fields such as `price`, `description`, `square_footage`, `parking_type`, etc.
 - computed numeric columns: `price_numeric`, `square_footage_numeric`, `price_per_sqft`
+- normalized sortable fields include numeric `price`, numeric `maintenance_fees`, numeric `annual_property_taxes`, integer `time_on_realtor` (days), integer `built_in` (year), and derived `city`/`next_open_house_date`
 - boolean columns for requested attributes (e.g. `in_suite_laundry`, `close_to_transit`, `gym`, `fireplace`)
 
 ## Notes

@@ -30,6 +30,20 @@ DEFAULT_URL = (
     "&PropertySearchTypeId=0&PriceMax=650000&BedRange=1-0&BathRange=1-0&Currency=CAD"
 )
 
+KNOWN_CITIES = [
+    "Vancouver",
+    "Surrey",
+    "New Westminster",
+    "Abbotsford",
+    "Coquitlam",
+    "Langley",
+    "Maple Ridge",
+    "Aldergrove",
+    "Tsawwassen",
+    "Burnaby",
+    "Port Coquitlam",
+]
+
 KEYWORD_RULES: Dict[str, List[str]] = {
     "in_suite_laundry": [r"in[-\s]?suite laundry", r"washer", r"dryer", r"laundry"],
     "dogs_no_restrictions": [r"dogs? allowed", r"pets? allowed", r"dog[-\s]?friendly"],
@@ -121,6 +135,58 @@ def _extract_first_money_value(text: str) -> str:
 def _parse_currency_to_float(value: str) -> float | None:
     if not value:
         return None
+
+
+def _parse_time_on_realtor_days(value: str) -> int | None:
+    if not value:
+        return None
+    v = value.lower()
+    if "hour" in v or "min" in v:
+        return 1
+    m = re.search(r"(\d+)", v)
+    if not m:
+        return None
+    n = int(m.group(1))
+    if "day" in v:
+        return n
+    return n
+
+
+def _parse_built_in_year(value: str, fallback_text: str = "", reference_year: int = 2026) -> int | None:
+    candidates = [value or "", fallback_text or ""]
+    for text in candidates:
+        if not text:
+            continue
+        year_match = re.search(r"\b(19\d{2}|20\d{2})\b", text)
+        if year_match:
+            return int(year_match.group(1))
+        age_match = re.search(r"\b(\d+)\s*year", text.lower())
+        if age_match:
+            age = int(age_match.group(1))
+            if 0 <= age <= 200:
+                return reference_year - age
+    return None
+
+
+def _infer_city(address: str, body_text: str = "") -> str:
+    haystack = f"{address}\n{body_text}".lower()
+    for city in KNOWN_CITIES:
+        if city.lower() in haystack:
+            return city
+    return ""
+
+
+def _parse_open_house_date_2026(month_text: str, day_text: str) -> str:
+    month_text = (month_text or "").strip()
+    day_match = re.search(r"\d{1,2}", day_text or "")
+    if not month_text or not day_match:
+        return ""
+    try:
+        month_num = dt.datetime.strptime(month_text[:3], "%b").month
+        day_num = int(day_match.group(0))
+        return dt.date(2026, month_num, day_num).isoformat()
+    except Exception:
+        return ""
     cleaned = re.sub(r"[^0-9.]", "", value)
     if not cleaned:
         return None
@@ -284,24 +350,38 @@ def scrape_listing(driver: uc.Chrome, url: str) -> Dict[str, object]:
     body_text = driver.find_element(By.TAG_NAME, "body").text
     description = _text_or_empty(driver, "#propertyDescriptionCon")
     address = _text_or_empty(driver, "#listingAddress") or extract_value(body_text, "Address")
-    price = _text_or_empty(driver, "#listingPriceValue") or _extract_first_money_value(body_text)
+    price_raw = _text_or_empty(driver, "#listingPriceValue") or _extract_first_money_value(body_text)
     square_footage = _text_or_empty(driver, "#SquareFootageIcon > div:nth-child(2)") or extract_value(body_text, "Square Footage")
+    built_in_raw = _text_or_empty(driver, "#propertyDetailsSectionContentSubCon_AgeOfBuilding > div:nth-child(2)")
+    time_on_realtor_raw = _text_or_empty(driver, "#propertyDetailsSectionContentSubCon_TimeOnRealtor > div:nth-child(2)")
+    maintenance_raw = _text_or_empty(driver, "#propertyDetailsSectionVal_MonthlyMaintenanceFees > div:nth-child(2)")
+    annual_taxes_raw = extract_value(body_text, "Annual Property Taxes")
+    next_open_house_date = _parse_open_house_date_2026(
+        _text_or_empty(driver, ".nextEventMonth"),
+        _text_or_empty(driver, ".nextEventDay"),
+    )
+
+    built_in_year = _parse_built_in_year(built_in_raw, extract_value(body_text, "Built in"))
+    time_on_realtor_days = _parse_time_on_realtor_days(time_on_realtor_raw)
+    price_num = _parse_currency_to_float(price_raw)
+    maintenance_num = _parse_currency_to_float(maintenance_raw)
+    annual_taxes_num = _parse_currency_to_float(annual_taxes_raw)
 
     record = ListingRecord(
         listing_url=url,
         listing_id=listing_id_match.group(1) if listing_id_match else "",
         title=driver.title.strip(),
         address=address,
-        price=price,
+        price=price_num if price_num is not None else 0.0,
         description=description.strip(),
         property_type=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_Title > div:nth-child(2)"),
         building_type=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_BuildingType > div:nth-child(2)"),
         square_footage=square_footage,
-        built_in=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_AgeOfBuilding > div:nth-child(2)"),
-        annual_property_taxes=extract_value(body_text, "Annual Property Taxes"),
+        built_in=built_in_year if built_in_year is not None else "",
+        annual_property_taxes=annual_taxes_num if annual_taxes_num is not None else 0.0,
         parking_type=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_ParkingType > div:nth-child(2)"),
-        time_on_realtor=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_TimeOnRealtor > div:nth-child(2)"),
-        maintenance_fees=_text_or_empty(driver, "#propertyDetailsSectionVal_MonthlyMaintenanceFees > div:nth-child(2)"),
+        time_on_realtor=time_on_realtor_days if time_on_realtor_days is not None else "",
+        maintenance_fees=maintenance_num if maintenance_num is not None else 0.0,
         full_text=body_text,
     )
     row = asdict(record)
@@ -310,11 +390,12 @@ def scrape_listing(driver: uc.Chrome, url: str) -> Dict[str, object]:
     row["appliances"] = _text_or_empty(driver, "#propertyDetailsSectionVal_AppliancesIncluded > div:nth-child(2)")
     row["building_amenities"] = _text_or_empty(driver, "#propertyDetailsSectionVal_BuildingAmenities > div:nth-child(2)")
 
-    price_num = _parse_currency_to_float(price)
     sqft_num = _parse_sqft_to_float(square_footage)
     row["price_numeric"] = price_num
     row["square_footage_numeric"] = sqft_num
     row["price_per_sqft"] = (price_num / sqft_num) if (price_num and sqft_num and sqft_num > 0) else None
+    row["next_open_house_date"] = next_open_house_date
+    row["city"] = _infer_city(address, body_text)
 
     row.update(matches_keywords(body_text + "\n" + description))
     log(
@@ -425,8 +506,18 @@ def run(
                 pass
 
         df = pd.DataFrame(rows)
-        link_col = df.pop("listing_url")
-        df.insert(0, "listing_url", link_col)
+        ordered_front = [
+            "listing_url",
+            "time_on_realtor",
+            "price_per_sqft",
+            "price",
+            "square_footage_numeric",
+            "built_in",
+            "city",
+        ]
+        existing_front = [col for col in ordered_front if col in df.columns]
+        remaining = [col for col in df.columns if col not in existing_front]
+        df = df[existing_front + remaining]
         df.to_excel(out_file, index=False)
         log(f"Final write complete. Wrote {len(df)} rows to {out_file}")
     finally:
