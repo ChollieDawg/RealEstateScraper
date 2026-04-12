@@ -27,11 +27,18 @@ Optional limit for quick trial:
 python scraper.py --max-listings 10
 ```
 
+Optional page cap while iterating sidebar pagination:
+
+```bash
+python scraper.py --max-pages 50
+```
+
 ## Output
 
 The Excel file includes:
 - `listing_url`
 - core fields such as `price`, `description`, `square_footage`, `parking_type`, etc.
+- computed numeric columns: `price_numeric`, `square_footage_numeric`, `price_per_sqft`
 - boolean columns for requested attributes (e.g. `in_suite_laundry`, `close_to_transit`, `gym`, `fireplace`)
 
 ## Notes

@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import re
 import time
 from dataclasses import asdict, dataclass
@@ -12,7 +11,6 @@ from typing import Dict, List, Set
 
 import pandas as pd
 import undetected_chromedriver as uc
-from bs4 import BeautifulSoup
 from selenium.common.exceptions import TimeoutException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -108,171 +106,174 @@ def _extract_first_money_value(text: str) -> str:
     return ""
 
 
+def _parse_currency_to_float(value: str) -> float | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"[^0-9.]", "", value)
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
+def _parse_sqft_to_float(value: str) -> float | None:
+    if not value:
+        return None
+    cleaned = re.sub(r"[^0-9.]", "", value)
+    if not cleaned:
+        return None
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def matches_keywords(text: str) -> Dict[str, bool]:
     normalized = re.sub(r"\s+", " ", text.lower())
     return {k: any(re.search(p, normalized, flags=re.IGNORECASE) for p in pats) for k, pats in KEYWORD_RULES.items()}
 
 
-def collect_listing_links(driver: uc.Chrome, max_scroll_rounds: int = 20, max_page_turns: int = 20) -> List[str]:
-    links: Set[str] = set()
+def collect_current_page_links(driver: uc.Chrome) -> List[str]:
+    links: List[str] = []
+    seen: Set[str] = set()
 
-    def collect() -> None:
-        selectors = [
-            "a[href*='/real-estate/']",
-            "#mapSidebarBodyCon .cardCon a[href*='/real-estate/']",
-            "div.cardCon > span > div > a[href*='/real-estate/']",
-        ]
-        for sel in selectors:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                href = el.get_attribute("href") or ""
-                if "/real-estate/" in href:
-                    links.add(_normalize_listing_url(href))
+    # Explicit left-side card slots requested by user: div.cardCon:nth-child(1..13)
+    for i in range(1, 14):
+        selector = f"div.cardCon:nth-child({i}) a[href*='/real-estate/']"
+        for el in driver.find_elements(By.CSS_SELECTOR, selector):
+            href = _normalize_listing_url(el.get_attribute("href") or "")
+            if "/real-estate/" in href and href not in seen:
+                seen.add(href)
+                links.append(href)
 
-        xpath_selectors = [
-            "//div[@id='mapSidebarBodyCon']//a[contains(@href, '/real-estate/')]",
-            "/html/body/form/div[5]/div[2]/span/div/div[3]/div/div[1]/div[2]/div[3]/div[1]/span/div/a",
-        ]
-        for xp in xpath_selectors:
-            for el in driver.find_elements(By.XPATH, xp):
-                href = el.get_attribute("href") or ""
-                if "/real-estate/" in href:
-                    links.add(_normalize_listing_url(href))
+    # Fallback: any visible card links on current page.
+    for el in driver.find_elements(By.CSS_SELECTOR, "div.cardCon a[href*='/real-estate/']"):
+        href = _normalize_listing_url(el.get_attribute("href") or "")
+        if "/real-estate/" in href and href not in seen:
+            seen.add(href)
+            links.append(href)
 
-    WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(3)
-    collect()
-
-    for _ in range(max_page_turns):
-        for _ in range(max_scroll_rounds):
-            driver.execute_script(
-                """
-                const sidebar = document.querySelector('#mapSidebarBodyCon');
-                if (sidebar) { sidebar.scrollTop += 1200; }
-                else { window.scrollBy(0, 600); }
-                """
-            )
-            time.sleep(0.8)
-            collect()
-
-        next_xpaths = [
-            "/html/body/form/div[5]/div[2]/span/div/div[3]/div/div[1]/div[2]/div[4]/span/div/a[3]",
-            "/html/body/form/div[5]/div[2]/span/div/div[3]/div/div[1]/div[2]/div[4]/span/div/a[3]/div",
-            "//i[contains(@class,'fa-angle-right')]",
-        ]
-        clicked = False
-        for xp in next_xpaths:
-            els = driver.find_elements(By.XPATH, xp)
-            if not els:
-                continue
-            try:
-                driver.execute_script("arguments[0].click();", els[0])
-                clicked = True
-                break
-            except Exception:
-                continue
-
-        if not clicked:
-            break
-        time.sleep(2.0)
-        collect()
-
-    if not links:
-        raise RuntimeError("No listing links found from map page after scrolling and pagination.")
-    return sorted(links)
+    return links
 
 
-def extract_structured_fields_from_html(html: str, body_text: str) -> Dict[str, str]:
-    fields = {"price": "", "address": ""}
-    soup = BeautifulSoup(html, "html.parser")
+def click_next_page(driver: uc.Chrome) -> bool:
+    selector = "#SideBarPagination > div:nth-child(1) > a:nth-child(4) > div:nth-child(1) > i:nth-child(1)"
+    icons = driver.find_elements(By.CSS_SELECTOR, selector)
+    if not icons:
+        return False
+    try:
+        driver.execute_script(
+            """
+            const icon = arguments[0];
+            const link = icon.closest('a');
+            if (link) link.click();
+            else icon.click();
+            """,
+            icons[0],
+        )
+        return True
+    except Exception:
+        return False
 
-    for script in soup.select("script[type='application/ld+json']"):
-        raw = script.get_text(strip=True)
-        if not raw:
-            continue
-        try:
-            data = json.loads(raw)
-        except Exception:
-            continue
 
-        items = data if isinstance(data, list) else [data]
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            offers = item.get("offers") or {}
-            addr = item.get("address") or {}
-            if not fields["price"] and isinstance(offers, dict):
-                p = offers.get("price")
-                c = offers.get("priceCurrency")
-                if p:
-                    fields["price"] = f"{c} {p}".strip()
-            if not fields["address"] and isinstance(addr, dict):
-                parts = [addr.get("streetAddress", ""), addr.get("addressLocality", ""), addr.get("addressRegion", "")]
-                address = ", ".join([x for x in parts if x])
-                if address:
-                    fields["address"] = address
-
-    if not fields["price"]:
-        fields["price"] = _extract_first_money_value(body_text) or extract_value(body_text, "Price")
-    if not fields["address"]:
-        fields["address"] = extract_value(body_text, "Address") or extract_value(body_text, "Location")
-    return fields
+def _text_or_empty(driver: uc.Chrome, css_selector: str) -> str:
+    els = driver.find_elements(By.CSS_SELECTOR, css_selector)
+    if not els:
+        return ""
+    return els[0].text.strip()
 
 
 def scrape_listing(driver: uc.Chrome, url: str) -> Dict[str, object]:
-    driver.get(url)
     time.sleep(1.8)
-    html = driver.page_source
     body_text = driver.find_element(By.TAG_NAME, "body").text
-
-    structured = extract_structured_fields_from_html(html, body_text)
-
-    description = ""
-    try:
-        description = driver.find_element(By.XPATH, "//*[contains(text(),'Listing Description')]/following::p[1]").text
-    except Exception:
-        pass
+    description = _text_or_empty(driver, "#propertyDescriptionCon")
+    address = _text_or_empty(driver, "#listingAddress") or extract_value(body_text, "Address")
+    price = _text_or_empty(driver, "#listingPriceValue") or _extract_first_money_value(body_text)
+    square_footage = _text_or_empty(driver, "#SquareFootageIcon > div:nth-child(2)") or extract_value(body_text, "Square Footage")
 
     listing_id_match = re.search(r"real-estate/(\d+)", url)
     record = ListingRecord(
         listing_url=url,
         listing_id=listing_id_match.group(1) if listing_id_match else "",
         title=driver.title.strip(),
-        address=structured.get("address", ""),
-        price=structured.get("price", ""),
+        address=address,
+        price=price,
         description=description.strip(),
-        property_type=extract_value(body_text, "Property Type"),
-        building_type=extract_value(body_text, "Building Type"),
-        square_footage=extract_value(body_text, "Square Footage"),
-        built_in=extract_value(body_text, "Built in"),
+        property_type=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_Title > div:nth-child(2)"),
+        building_type=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_BuildingType > div:nth-child(2)"),
+        square_footage=square_footage,
+        built_in=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_AgeOfBuilding > div:nth-child(2)"),
         annual_property_taxes=extract_value(body_text, "Annual Property Taxes"),
-        parking_type=extract_value(body_text, "Parking Type"),
-        time_on_realtor=extract_value(body_text, "Time on REALTOR.ca"),
-        maintenance_fees=extract_value(body_text, "Maintenance Fees"),
+        parking_type=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_ParkingType > div:nth-child(2)"),
+        time_on_realtor=_text_or_empty(driver, "#propertyDetailsSectionContentSubCon_TimeOnRealtor > div:nth-child(2)"),
+        maintenance_fees=_text_or_empty(driver, "#propertyDetailsSectionVal_MonthlyMaintenanceFees > div:nth-child(2)"),
         full_text=body_text,
     )
     row = asdict(record)
+    row["bedrooms"] = _text_or_empty(driver, "#BedroomIcon > div:nth-child(2)")
+    row["bathrooms"] = _text_or_empty(driver, "#BathroomIcon > div:nth-child(2)")
+    row["appliances"] = _text_or_empty(driver, "#propertyDetailsSectionVal_AppliancesIncluded > div:nth-child(2)")
+    row["building_amenities"] = _text_or_empty(driver, "#propertyDetailsSectionVal_BuildingAmenities > div:nth-child(2)")
+
+    price_num = _parse_currency_to_float(price)
+    sqft_num = _parse_sqft_to_float(square_footage)
+    row["price_numeric"] = price_num
+    row["square_footage_numeric"] = sqft_num
+    row["price_per_sqft"] = (price_num / sqft_num) if (price_num and sqft_num and sqft_num > 0) else None
+
     row.update(matches_keywords(body_text + "\n" + description))
     return row
 
 
-def run(start_url: str, out_file: str, max_listings: int | None = None, headless: bool = False) -> None:
+def run(
+    start_url: str,
+    out_file: str,
+    max_listings: int | None = None,
+    headless: bool = False,
+    max_pages: int = 200,
+) -> None:
     driver = build_driver(headless=headless)
     try:
         driver.get(start_url)
-        links = collect_listing_links(driver)
+        WebDriverWait(driver, 20).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(3)
 
-        if max_listings:
-            links = links[:max_listings]
-
+        seen_links: Set[str] = set()
         rows: List[Dict[str, object]] = []
-        for idx, link in enumerate(links, start=1):
-            try:
-                print(f"[{idx}/{len(links)}] Scraping {link}")
-                rows.append(scrape_listing(driver, link))
-            except TimeoutException:
-                print(f"Timeout while scraping {link}")
-            except Exception as exc:
-                print(f"Error scraping {link}: {exc}")
+        pages_processed = 0
+        while pages_processed < max_pages:
+            current_links = collect_current_page_links(driver)
+            if not current_links:
+                break
+
+            for link in current_links:
+                if link in seen_links:
+                    continue
+                seen_links.add(link)
+                if max_listings and len(rows) >= max_listings:
+                    break
+                try:
+                    print(f"[{len(rows)+1}] Scraping {link}")
+                    driver.execute_script("window.open(arguments[0], '_blank');", link)
+                    driver.switch_to.window(driver.window_handles[-1])
+                    rows.append(scrape_listing(driver, link))
+                except TimeoutException:
+                    print(f"Timeout while scraping {link}")
+                except Exception as exc:
+                    print(f"Error scraping {link}: {exc}")
+                finally:
+                    if len(driver.window_handles) > 1:
+                        driver.close()
+                        driver.switch_to.window(driver.window_handles[0])
+
+            if max_listings and len(rows) >= max_listings:
+                break
+            if not click_next_page(driver):
+                break
+            pages_processed += 1
+            time.sleep(2.0)
 
         if not rows:
             raise RuntimeError("No listing rows were scraped.")
@@ -291,10 +292,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--url", default=DEFAULT_URL, help="Map search URL containing your criteria")
     parser.add_argument("--output", default="realtor_listings.xlsx", help="Output Excel file path")
     parser.add_argument("--max-listings", type=int, default=None, help="Optional cap for number of listings")
+    parser.add_argument("--max-pages", type=int, default=200, help="Maximum number of sidebar pages to process")
     parser.add_argument("--headless", action="store_true", help="Run browser headless (default: headed)")
     return parser
 
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
-    run(start_url=args.url, out_file=args.output, max_listings=args.max_listings, headless=args.headless)
+    run(
+        start_url=args.url,
+        out_file=args.output,
+        max_listings=args.max_listings,
+        headless=args.headless,
+        max_pages=args.max_pages,
+    )
