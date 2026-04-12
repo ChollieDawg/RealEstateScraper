@@ -17,6 +17,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
+# Suppress noisy undetected-chromedriver destructor double-quit on some Windows setups.
+try:
+    uc.Chrome.__del__ = lambda self: None  # type: ignore[method-assign]
+except Exception:
+    pass
+
 DEFAULT_URL = (
     "https://www.realtor.ca/map#ZoomLevel=11&Center=49.162262%2C-122.742322"
     "&LatitudeMax=49.30932&LongitudeMax=-122.20365&LatitudeMin=49.01477"
@@ -82,13 +88,7 @@ def build_driver(headless: bool) -> uc.Chrome:
         options.add_argument("--headless=new")
     options.add_argument("--window-size=1400,2000")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    driver = uc.Chrome(options=options)
-    # Avoid undetected-chromedriver destructor double-quit noise on Windows.
-    try:
-        driver.__del__ = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
-    except Exception:
-        pass
-    return driver
+    return uc.Chrome(options=options)
 
 
 def log(message: str) -> None:
@@ -172,22 +172,36 @@ def collect_current_page_links(driver: uc.Chrome) -> List[str]:
 
 
 def click_next_page(driver: uc.Chrome) -> bool:
-    selector = "#SideBarPagination > div:nth-child(1) > a:nth-child(4) > div:nth-child(1) > i:nth-child(1)"
-    icons = driver.find_elements(By.CSS_SELECTOR, selector)
-    if not icons:
+    # Use the anchor itself (not just nested icon) because icon may be off-screen/virtualized.
+    anchor_selector = "#SideBarPagination > div:nth-child(1) > a:nth-child(4)"
+    anchors = driver.find_elements(By.CSS_SELECTOR, anchor_selector)
+    if not anchors:
         log("Next-page button not found; pagination is exhausted.")
         return False
     try:
         driver.execute_script(
             """
-            const icon = arguments[0];
-            const link = icon.closest('a');
-            if (link) link.click();
-            else icon.click();
-            """,
-            icons[0],
+            const sidebar = document.querySelector('#mapSidebarBodyCon');
+            if (sidebar) sidebar.scrollTop = 0;
+            """
         )
-        log("Clicked next-page button.")
+        time.sleep(0.3)
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", anchors[0])
+        driver.execute_script("arguments[0].click();", anchors[0])
+        log("Clicked next-page button (anchor click).")
+        return True
+    except Exception:
+        pass
+    try:
+        driver.execute_script(
+            """
+            const anchor = document.querySelector('#SideBarPagination > div:nth-child(1) > a:nth-child(4)');
+            if (!anchor) return false;
+            anchor.click();
+            return true;
+            """,
+        )
+        log("Clicked next-page button (JS fallback).")
         return True
     except Exception:
         log("Failed to click next-page button.")
@@ -325,9 +339,11 @@ def run(
         if not initial_links:
             log("No initial links found yet; continuing with pagination loop for additional retries.")
         main_handle = driver.current_window_handle
-        driver.execute_script("window.open('about:blank', '_blank');")
-        worker_handle = driver.window_handles[-1]
-        log("Opened dedicated worker tab for listing scrapes.")
+        driver.switch_to.new_window("tab")
+        worker_handle = driver.current_window_handle
+        driver.get("about:blank")
+        driver.switch_to.window(main_handle)
+        log("Opened dedicated worker tab for listing scrapes via new_window('tab').")
 
         while pages_processed < max_pages:
             driver.switch_to.window(main_handle)

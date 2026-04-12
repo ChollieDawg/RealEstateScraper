@@ -52,6 +52,7 @@ The Excel file includes:
 - Realtor.ca is a dynamic site; selectors and field labels may change.
 - Link collection uses Selenium + undetected-chromedriver sidebar/card scraping and pagination; tune selectors/xpaths if Realtor.ca updates markup.
 - Runtime flow uses one dedicated worker tab for listing detail scrapes while the original tab stays on search results/pagination.
+- Pagination is performed by clicking the results-page anchor `#SideBarPagination > div:nth-child(1) > a:nth-child(4)` on the main tab.
 - The scraper uses structured data (`application/ld+json`) plus selector/text fallbacks for more reliable price/address extraction.
 - Some attributes are inferred via keyword matching from listing text and may be imperfect.
 - If needed, tune `KEYWORD_RULES` and scroll behavior in `scraper.py`.
